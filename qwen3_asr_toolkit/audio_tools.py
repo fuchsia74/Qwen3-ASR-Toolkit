@@ -19,7 +19,6 @@ def load_audio(file_path: str) -> np.ndarray:
         wav_data, _ = librosa.load(file_path, sr=WAV_SAMPLE_RATE, mono=True)
         return wav_data
     except Exception as e:
-        print(e)
         # After librosa fails, use a more powerful ffmpeg as a backup.
         try:
             command = [

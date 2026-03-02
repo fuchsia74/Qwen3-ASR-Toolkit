@@ -2,7 +2,6 @@ import argparse
 import os
 import srt
 import requests
-import dashscope
 import concurrent.futures
 
 from tqdm import tqdm
@@ -19,10 +18,18 @@ def parse_args():
         description="Python toolkit for the Qwen3-ASR API—parallel high‑throughput calls, robust long‑audio transcription, multi‑sample‑rate support."
     )
     parser.add_argument("--input-file", '-i', type=str, required=True, help="Input media file path")
-    parser.add_argument("--context", '-c', type=str, default="", help="Any text context content for Qwen3-ASR-Flash")
+    parser.add_argument("--context", '-c', type=str, default="", help="Optional text context for ASR")
+    parser.add_argument("--provider", choices=["local", "dashscope"], default="local", help="ASR backend to use")
+    parser.add_argument("--api-url", type=str, default="http://localhost:8000/v1/chat/completions", help="Local ASR API endpoint")
+    parser.add_argument("--model", type=str, default=None, help="Model name for the selected API")
+    parser.add_argument("--api-timeout", type=int, default=300, help="API request timeout (seconds)")
+    parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature for the local API")
     parser.add_argument("--dashscope-api-key", '-key', type=str, help="DashScope API key")
+    parser.add_argument("--skip-failed", action="store_true", help="Skip failed segments instead of aborting")
+    parser.add_argument("--max-retries", type=int, default=10, help="Max retries per segment")
     parser.add_argument("--num-threads", '-j', type=int, default=4, help="Number of threads to use for parallel calls")
     parser.add_argument("--vad-segment-threshold", '-d', type=int, default=120, help="Segment threshold seconds for VAD")
+    parser.add_argument("--max-segment-seconds", type=int, default=180, help="Hard limit for segment length (seconds)")
     parser.add_argument("--tmp-dir", '-t', type=str, default=os.path.join(os.path.expanduser("~"), "qwen3-asr-cache"), help="Temp directory path")
     parser.add_argument("--save-srt", '-srt', action="store_true", help="Save SRT subtitle file")
     parser.add_argument("--silence", '-s', action="store_true", help="Reduce the output info on the terminal")
@@ -33,9 +40,17 @@ def main():
     args = parse_args()
     input_file = args.input_file
     context = args.context
+    provider = args.provider
+    api_url = args.api_url
+    model = args.model
+    api_timeout = args.api_timeout
+    temperature = args.temperature
+    skip_failed = args.skip_failed
     dashscope_api_key = args.dashscope_api_key
+    max_retries = args.max_retries
     num_threads = args.num_threads
     vad_segment_threshold = args.vad_segment_threshold
+    max_segment_seconds = args.max_segment_seconds
     tmp_dir = args.tmp_dir
     save_srt = args.save_srt
     silence = args.silence
@@ -51,12 +66,20 @@ def main():
     elif not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file \"{input_file}\" does not exist!")
 
-    if dashscope_api_key:
-        dashscope.api_key = dashscope_api_key
-    else:
-        assert "DASHSCOPE_API_KEY" in os.environ, f"Please set DASHSCOPE_API_KEY as an environment variable, or specify it with '-key' argument"
+    if provider == "dashscope":
+        if dashscope_api_key:
+            os.environ["DASHSCOPE_API_KEY"] = dashscope_api_key
+        elif "DASHSCOPE_API_KEY" not in os.environ:
+            raise ValueError("Please set DASHSCOPE_API_KEY or pass --dashscope-api-key.")
 
-    qwen3asr = QwenASR(model="qwen3-asr-flash")
+    qwen3asr = QwenASR(
+        provider=provider,
+        api_url=api_url,
+        model=model,
+        timeout_s=api_timeout,
+        temperature=temperature,
+        max_retries=max_retries,
+    )
 
     wav = load_audio(input_file)
     if not silence:
@@ -67,7 +90,12 @@ def main():
         if not silence:
             print(f"Wav duration is longer than 3 min, initializing Silero VAD model for segmenting...")
         worker_vad_model = load_silero_vad(onnx=True)
-        wav_list = process_vad(wav, worker_vad_model, segment_threshold_s=vad_segment_threshold)
+        wav_list = process_vad(
+            wav,
+            worker_vad_model,
+            segment_threshold_s=vad_segment_threshold,
+            max_segment_threshold_s=max_segment_seconds,
+        )
         if not silence:
             print(f"Segmenting done, total segments: {len(wav_list)}")
     else:
@@ -93,12 +121,22 @@ def main():
             for idx, wav_path in enumerate(wav_path_list)
         }
         if not silence:
-            pbar = tqdm(total=len(future_dict), desc="Calling Qwen3-ASR-Flash API")
+            pbar = tqdm(total=len(future_dict), desc="Calling local ASR API")
         for future in concurrent.futures.as_completed(future_dict):
             idx = future_dict[future]
-            language, recog_text = future.result()
-            results.append((idx, recog_text))
-            languages.append(language)
+            try:
+                language, recog_text = future.result()
+                results.append((idx, recog_text))
+                languages.append(language)
+            except Exception as e:
+                if skip_failed:
+                    results.append((idx, ""))
+                    languages.append("Unknown")
+                    if not silence:
+                        error_name = e.__class__.__name__
+                        print(f"Segment {idx} failed ({error_name}). Skipped.")
+                else:
+                    raise
             if not silence:
                 pbar.update(1)
         if not silence:
@@ -107,7 +145,7 @@ def main():
     # Sort and splice in the original order
     results.sort(key=lambda x: x[0])
     full_text = " ".join(text for _, text in results)
-    language = Counter(languages).most_common(1)[0][0]
+    language = Counter(languages).most_common(1)[0][0] if languages else "Unknown"
 
     if not silence:
         print(f"Detected Language: {language}")
@@ -126,7 +164,7 @@ def main():
         f.write(language + '\n')
         f.write(full_text + '\n')
 
-    print(f"Full transcription of \"{input_file}\" from Qwen3-ASR-Flash API saved to \"{save_file}\"!")
+    print(f"Full transcription of \"{input_file}\" from local ASR API saved to \"{save_file}\"!")
 
     # Save subtitles to local SRT file
     if args.save_srt:
@@ -142,9 +180,10 @@ def main():
                 content=content
             ))
         final_srt_content = srt.compose(subtitles)
-        with open(os.path.splitext(save_file)[0] + ".srt", 'w') as f:
+        srt_path = os.path.splitext(save_file)[0] + ".srt"
+        with open(srt_path, 'w') as f:
             f.write(final_srt_content)
-    print(f"SRT subtitles of \"{input_file}\" from Qwen3-ASR-Flash API saved to \"{save_dir}\"!")
+        print(f"SRT subtitles of \"{input_file}\" from local ASR API saved to \"{srt_path}\"!")
 
 
 if __name__ == '__main__':
